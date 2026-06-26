@@ -525,3 +525,42 @@ def test_xpu_priority_backends_batched_triton_opt_in():
     assert xpu_priority_backends(use_batched_triton=True) == [
         UnquantizedMoeBackend.BATCHED_TRITON
     ]
+
+
+# Shared bucketing helper used by both the reference BatchedPrepareAndFinalize
+# and the EP BatchedAgRsPrepareAndFinalize. Validates that a rank's local
+# expert slice is packed in token order, matching a per-expert reference loop.
+@pytest.mark.parametrize("num_experts,num_local_experts,rank", [(8, 8, 0), (8, 4, 1)])
+@pytest.mark.parametrize("num_tokens,topk", [(64, 2), (130, 1)])
+def test_bucket_tokens_to_batched(
+    num_experts, num_local_experts, rank, num_tokens, topk
+):
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.batched import (
+        bucket_tokens_to_batched,
+    )
+
+    set_random_seed(123)
+    device = "xpu" if current_platform.is_xpu() else "cuda"
+    if not (current_platform.is_xpu() or current_platform.is_cuda_alike()):
+        pytest.skip("No CUDA-alike or XPU device available")
+
+    k = 96
+    a1 = torch.randn((num_tokens, k), device=device, dtype=torch.bfloat16)
+    topk_ids = torch.stack(
+        [torch.randperm(num_experts, device=device)[:topk] for _ in range(num_tokens)]
+    ).to(torch.int32)
+    max_num_tokens = num_tokens
+
+    b_a1, tokens_per_expert = bucket_tokens_to_batched(
+        a1, topk_ids, num_experts, num_local_experts, rank, max_num_tokens, a1.dtype
+    )
+
+    first = num_local_experts * rank
+    for idx in range(num_local_experts):
+        expert_id = first + idx
+        hit = (topk_ids == expert_id).any(dim=1)
+        rows = int(hit.sum().item())
+        assert int(tokens_per_expert[idx].item()) == rows
+        torch.testing.assert_close(b_a1[idx, :rows], a1[hit])
+        assert b_a1[idx, rows:].abs().max().item() == 0.0
+    assert int(tokens_per_expert[num_local_experts:].sum().item()) == 0
